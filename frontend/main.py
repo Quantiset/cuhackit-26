@@ -82,6 +82,7 @@ SIDEBAR_BG = (20, 20, 30, 180)
 pygame.init()
 pygame.mixer.init()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+pygame.scrap.init()
 pygame.display.set_caption("Dance Game – Body Detection")
 clock = pygame.time.Clock()
 
@@ -100,10 +101,25 @@ def load_avatar(index: int) -> pygame.Surface:
     return pygame.transform.smoothscale(img, (AVATAR_SIZE, AVATAR_SIZE))
 
 # ── Video download & conversion ─────────────────────────────────────
-VIDEO_URL = "https://www.youtube.com/watch?v=3F4OEY5Hxfc"
-VIDEO_NAME = VIDEO_URL.split("v=")[-1]
 PRE_VIDEO_PATH = "video.mp4"
-VIDEO_PATH = f"{VIDEO_NAME}.mp4"
+
+# Global video state
+VIDEO_URL = ""
+VIDEO_NAME = ""
+VIDEO_PATH = ""
+cap_video = None
+video_fps = 0.0
+video_total_frames = 0
+cached_frame_surf = None
+jump_times = []
+
+JSONL_PATH = os.path.join(os.path.dirname(__file__), "predicted_actions.jsonl")
+CUE_LEAD   = 0.15
+CUE_SCORE_LEAD = 0.30
+CUE_LINGER = 0.35
+CUE_RADIUS = 88
+CUE_APPROACH_TIME = 2.0
+MIN_CUE_GAP = 0.5
 
 def download_youtube(url: str, output: str = PRE_VIDEO_PATH):
     ydl_opts = {
@@ -128,43 +144,45 @@ def convert_video(input_path: str, output_path: str):
 def upload_to_s3(file_path: str, key: str):
     s3.upload_file(file_path, bucket_name, key)
 
-# ── Ensure video is ready ────────────────────────────────────────────
-if not os.path.exists(VIDEO_PATH):
-    if os.path.exists(PRE_VIDEO_PATH):
-        os.remove(PRE_VIDEO_PATH)
-    if os.path.exists(VIDEO_PATH):
-        os.remove(VIDEO_PATH)
+def init_video(url: str):
+    global VIDEO_URL, VIDEO_NAME, VIDEO_PATH
+    global cap_video, video_fps, video_total_frames, jump_times
+    
+    VIDEO_URL = url
+    VIDEO_NAME = VIDEO_URL.split("v=")[-1] if "v=" in VIDEO_URL else VIDEO_URL.split("/")[-1]
+    VIDEO_PATH = f"{VIDEO_NAME}.mp4"
 
-    print("Downloading video...")
-    download_youtube(VIDEO_URL, PRE_VIDEO_PATH)
+    # ── Ensure video is ready ────────────────────────────────────────────
+    if not os.path.exists(VIDEO_PATH):
+        if os.path.exists(PRE_VIDEO_PATH):
+            os.remove(PRE_VIDEO_PATH)
+        if os.path.exists(VIDEO_PATH):
+            os.remove(VIDEO_PATH)
 
-    print("Converting video...")
-    convert_video(PRE_VIDEO_PATH, VIDEO_PATH)
+        print("Downloading video...")
+        download_youtube(VIDEO_URL, PRE_VIDEO_PATH)
 
-    print("Uploading video to S3...")
-    upload_to_s3(VIDEO_PATH, VIDEO_NAME + ".mp4")
-else:
-    print("Video already exists locally, skipping download and conversion.")
+        print("Converting video...")
+        convert_video(PRE_VIDEO_PATH, VIDEO_PATH)
 
-response = requests.get("http://ec2-100-54-112-34.compute-1.amazonaws.com:8000/download-result?id=" + VIDEO_NAME)
-response.raise_for_status()
-with open("predicted_actions.jsonl", "wb") as f:
-    f.write(response.content)
+        print("Uploading video to S3...")
+        upload_to_s3(VIDEO_PATH, VIDEO_NAME + ".mp4")
+    else:
+        print("Video already exists locally, skipping download and conversion.")
 
-cap_video = cv2.VideoCapture(VIDEO_PATH)
-video_fps = cap_video.get(cv2.CAP_PROP_FPS)
-if video_fps <= 0:
-    video_fps = 20.0
-video_total_frames = int(cap_video.get(cv2.CAP_PROP_FRAME_COUNT))
-cached_frame_surf = None
+    response = requests.get("http://ec2-100-54-112-34.compute-1.amazonaws.com:8000/download-result?id=" + VIDEO_NAME)
+    response.raise_for_status()
+    with open(JSONL_PATH, "wb") as f:
+        f.write(response.content)
 
-JSONL_PATH = os.path.join(os.path.dirname(__file__), "predicted_actions.jsonl")
-CUE_LEAD   = 0.15
-CUE_SCORE_LEAD = 0.30
-CUE_LINGER = 0.35
-CUE_RADIUS = 88
-CUE_APPROACH_TIME = 2.0
-MIN_CUE_GAP = 0.5
+    cap_video = cv2.VideoCapture(VIDEO_PATH)
+    video_fps = cap_video.get(cv2.CAP_PROP_FPS)
+    if video_fps <= 0:
+        video_fps = 20.0
+    video_total_frames = int(cap_video.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    jump_times = load_jump_times(JSONL_PATH, video_fps)
+
 
 def generate_voice(text: str):
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -257,11 +275,6 @@ def load_jump_times(jsonl_path, fps):
             times.append(t)
     return times
 
-jump_times = load_jump_times(JSONL_PATH, video_fps)
-print(f"Jump cues loaded: {len(jump_times)} onsets")
-if jump_times:
-    print(f"  First 5 times: {jump_times[:5]}")
-
 # ── Webcam ──────────────────────────────────────────────────────────
 cap_webcam = cv2.VideoCapture(0)
 webcam_fps = cap_webcam.get(cv2.CAP_PROP_FPS) or 30.0
@@ -284,11 +297,15 @@ def count_people_yolo(frame_bgr):
 detector = None
 
 # ── State ──────────────────────────────────────────────────────────
+STATE_INPUT     = -1
+STATE_LOADING   = -2
 STATE_INTRO     = 0
 STATE_COUNTDOWN = 1
 STATE_PLAYING   = 2
 
-state = STATE_INTRO
+state = STATE_INPUT
+input_url_text = ""
+
 countdown_start: float = 0.0
 locked_player_count: int = 0
 player_avatars: list[pygame.Surface] = []
@@ -451,8 +468,53 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            running = False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
+            
+            # STATE_INPUT handling
+            if state == STATE_INPUT:
+                if event.key == pygame.K_RETURN:
+                    if input_url_text.strip():
+                        state = STATE_LOADING
+                elif event.key == pygame.K_BACKSPACE:
+                    input_url_text = input_url_text[:-1]
+                elif event.key == pygame.K_v and (pygame.key.get_mods() & pygame.KMOD_CTRL or pygame.key.get_mods() & pygame.KMOD_META):
+                    try:
+                        import pyperclip
+                        input_url_text += pyperclip.paste()
+                    except ImportError:
+                        try:
+                            # Fallback to pygame scrap
+                            clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+                            if clip:
+                                input_url_text += clip.decode("utf-8").strip('\x00')
+                        except Exception:
+                            pass
+                else:
+                    input_url_text += event.unicode
+                    
+            elif event.key == pygame.K_SPACE:
+                # Force state progression
+                if state == STATE_INTRO:
+                    state = STATE_COUNTDOWN
+                    countdown_start = time.time()
+                elif state == STATE_PLAYING:
+                    # Reset
+                    state = STATE_INPUT
+                    input_url_text = ""
+                    player_avatars.clear()
+                    player_id_map.clear()
+                    player_actions.clear()
+                    player_scores.clear()
+                    player_calories.clear()
+                    player_prev_jumping.clear()
+                    player_inactive_frames.clear()
+                    detector = None
+                    if cap_video is not None:
+                        cap_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        last_video_frame_idx = -1
+                    start_time = time.time()
 
     # ── Webcam frame + detection ────────────────────────────────────
     ret_wc, wc_frame = cap_webcam.read()
@@ -466,18 +528,54 @@ while running:
         webcam_frame_idx += 1
 
     # ── Draw background ─────────────────────────────────────────────
-    screen.fill(DARK)
+    # Input state is purely black. Loading state shows webcam.
+    screen.fill(BLACK if state == STATE_INPUT else DARK)
     video_playing = False
+    
     if state == STATE_PLAYING:
         video_playing = draw_video_bg(screen, ct)
         if not video_playing and ret_wc:
             # Video ended, fallback to webcam background
             draw_webcam_bg(screen, wc_frame)
-    elif ret_wc:
+    elif state != STATE_INPUT and ret_wc:
         draw_webcam_bg(screen, wc_frame)
 
     # ── State machine ───────────────────────────────────────────────
-    if state == STATE_INTRO:
+    if state == STATE_INPUT:
+        # Pure black layout without webcam
+        input_rect = pygame.Rect(WINDOW_WIDTH // 2 - 400, WINDOW_HEIGHT // 2 - 30, 800, 60)
+        pygame.draw.rect(screen, (40, 40, 50, 200), input_rect)
+        pygame.draw.rect(screen, WHITE, input_rect, 2)
+        
+        prompt_surf = leaderboard_title_font.render("Enter YouTube URL (Minecraft Parkour):", True, WHITE)
+        screen.blit(prompt_surf, (input_rect.x, input_rect.y - 50))
+        
+        url_surf = leaderboard_font.render(input_url_text, True, (200, 200, 200))
+        text_x = input_rect.x + 10
+        if url_surf.get_width() > input_rect.width - 20:
+            text_x = input_rect.right - url_surf.get_width() - 10
+        screen.blit(url_surf, (text_x, input_rect.y + 15))
+
+    elif state == STATE_LOADING:
+        # Draw webcam + loading text
+        loading_surf = leaderboard_title_font.render("Loading video... Please wait.", True, ORANGE)
+        # Add a subtle dark backdrop for readability over webcam
+        bg_rect = loading_surf.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))
+        bg_rect.inflate_ip(40, 20)
+        pygame.draw.rect(screen, (0, 0, 0, 150), bg_rect)
+        screen.blit(loading_surf, loading_surf.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)))
+        pygame.display.flip()
+        
+        try:
+            init_video(input_url_text.strip())
+            state = STATE_COUNTDOWN
+            countdown_start = time.time()
+        except Exception as e:
+            print(f"Error loading video: {e}")
+            state = STATE_INPUT
+            input_url_text = ""
+                
+    elif state == STATE_INTRO:
         draw_centered_text(
             screen, "Stand in frame!", title_font, WHITE, WINDOW_HEIGHT // 2 - 30
         )
@@ -605,7 +703,7 @@ while running:
         draw_leaderboard(screen)
 
     # ── Debug cam (bottom-left) ─────────────────────────────────────
-    if ret_wc:
+    if ret_wc and state not in [STATE_INPUT, STATE_LOADING]:
         debug_frame = wc_frame.copy()
         h, w = debug_frame.shape[:2]
         for p in persons:
@@ -674,6 +772,8 @@ while running:
 # ── Cleanup ─────────────────────────────────────────────────────────
 if detector is not None:
     detector.close()
-cap_webcam.release()
-cap_video.release()
+if cap_webcam is not None:
+    cap_webcam.release()
+if cap_video is not None:
+    cap_video.release()
 pygame.quit()
