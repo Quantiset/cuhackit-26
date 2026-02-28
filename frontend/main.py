@@ -5,6 +5,7 @@ import math
 import time
 from dotenv import load_dotenv
 
+import threading
 import json
 import pygame
 import cv2
@@ -79,6 +80,7 @@ SIDEBAR_BG = (20, 20, 30, 180)
 
 # ── Pygame init ─────────────────────────────────────────────────────
 pygame.init()
+pygame.mixer.init()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 pygame.display.set_caption("Dance Game – Body Detection")
 clock = pygame.time.Clock()
@@ -98,7 +100,7 @@ def load_avatar(index: int) -> pygame.Surface:
     return pygame.transform.smoothscale(img, (AVATAR_SIZE, AVATAR_SIZE))
 
 # ── Video download & conversion ─────────────────────────────────────
-VIDEO_URL = "https://www.youtube.com/watch?v=lekKHbYQGxM"
+VIDEO_URL = "https://www.youtube.com/watch?v=3F4OEY5Hxfc"
 VIDEO_NAME = VIDEO_URL.split("v=")[-1]
 PRE_VIDEO_PATH = "video.mp4"
 VIDEO_PATH = f"{VIDEO_NAME}.mp4"
@@ -165,8 +167,8 @@ CUE_APPROACH_TIME = 2.0
 MIN_CUE_GAP = 0.5
 
 def generate_voice(text: str):
-    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")  # set in your environment
-    VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # example voice; you can replace with your preferred voice
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+    VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
     OUTPUT_FILE = "speech.mp3"
     TEXT_TO_SPEAK = text
 
@@ -186,7 +188,7 @@ def generate_voice(text: str):
         }
     }
 
-    response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, headers=headers)
     response.raise_for_status()
 
     # ── Save the audio ─────────────────────────────
@@ -194,6 +196,47 @@ def generate_voice(text: str):
         f.write(response.content)
 
     print(f"Saved speech to {OUTPUT_FILE}")
+
+def play_congratulations():
+    """Call ElevenLabs TTS and play 'congratulations' in a background thread."""
+    def _run():
+        try:
+            ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+            VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+            headers = {
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "text": "Congratulations!",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+            }
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+
+            # Use a unique temp file so pygame never holds a lock on the one we're writing
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp.write(response.content)
+                audio_path = tmp.name
+
+            # Wait for any currently-playing music to finish before loading the next
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+
+            pygame.mixer.music.load(audio_path)
+            pygame.mixer.music.play()
+
+            # Wait for playback to finish, then delete the temp file
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            os.remove(audio_path)
+
+        except Exception as e:
+            print(f"[TTS error] {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 def load_jump_times(jsonl_path, fps):
     """Extract onset times (seconds) when space first appears, with min gap."""
@@ -553,6 +596,7 @@ while running:
                         
                 if valid_jump:
                     player_scores[slot] += 10
+                    play_congratulations()
                 else:
                     player_scores[slot] -= 5
 
