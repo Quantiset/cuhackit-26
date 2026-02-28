@@ -1,6 +1,7 @@
 import subprocess
 import os
 import sys
+import math
 import time
 from dotenv import load_dotenv
 
@@ -13,6 +14,11 @@ import yt_dlp
 import boto3
 import imageio_ffmpeg as ffmpeg
 
+# ── Allow importing body.py from the project root ──────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from body_new import PoseDetector, draw_skeleton  # noqa: E402
+from ultralytics import YOLO  # noqa: E402
+
 # ── Load environment ────────────────────────────────────────────────
 load_dotenv()
 
@@ -23,6 +29,32 @@ s3 = boto3.client(
     region_name='us-east-1'
 )
 bucket_name = "minecraft-videos-dance"
+
+
+# ── Constants ───────────────────────────────────────────────────────
+WINDOW_WIDTH  = 1280
+WINDOW_HEIGHT = 720
+FPS           = 30
+AVATAR_SIZE   = 80
+COUNTDOWN_SECONDS = 5
+CIRCLE_RADIUS = 14
+SIDEBAR_WIDTH = 220
+
+DEBUG_W = WINDOW_WIDTH  // 4
+DEBUG_H = WINDOW_HEIGHT // 4
+
+# ── Colours ─────────────────────────────────────────────────────────
+DARK   = (18, 18, 24)
+WHITE  = (255, 255, 255)
+BLACK  = (0, 0, 0)
+GREEN  = (0, 200, 80)
+ORANGE = (255, 160, 0)
+GOLD   = (255, 215, 0)
+BLUE   = (0, 150, 255)
+PINK   = (255, 0, 200)
+SIDEBAR_BG = (20, 20, 30, 180)
+
+CUE_COLORS = [GREEN, BLUE, PINK, ORANGE]
 
 # ── Game constants ──────────────────────────────────────────────────
 WINDOW_WIDTH  = 1280
@@ -126,13 +158,46 @@ cached_frame_surf = None
 
 JSONL_PATH = os.path.join(os.path.dirname(__file__), "predicted_actions.jsonl")
 CUE_LEAD   = 0.15
+CUE_SCORE_LEAD = 0.30
 CUE_LINGER = 0.35
-CUE_RADIUS = 50
+CUE_RADIUS = 88
 CUE_APPROACH_TIME = 2.0
+MIN_CUE_GAP = 0.5
+
+def generate_voice(text: str):
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")  # set in your environment
+    VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # example voice; you can replace with your preferred voice
+    OUTPUT_FILE = "speech.mp3"
+    TEXT_TO_SPEAK = text
+
+    # ── Request ───────────────────────────────────
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "text": TEXT_TO_SPEAK,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75
+        }
+    }
+
+    response = requests.post(url, json=payload)
+    response.raise_for_status()
+
+    # ── Save the audio ─────────────────────────────
+    with open(OUTPUT_FILE, "wb") as f:
+        f.write(response.content)
+
+    print(f"Saved speech to {OUTPUT_FILE}")
 
 def load_jump_times(jsonl_path, fps):
-    """Extract onset times (seconds) when space first appears."""
-    times = []
+    """Extract onset times (seconds) when space first appears, with min gap."""
+    raw_times = []
     prev_space = False
     with open(jsonl_path) as f:
         for line in f:
@@ -140,8 +205,13 @@ def load_jump_times(jsonl_path, fps):
             frame = entry["frame"]
             has_space = "key.keyboard.space" in entry.get("keyboard", {}).get("keys", [])
             if has_space and not prev_space:
-                times.append(frame / fps)
+                raw_times.append(frame / fps)
             prev_space = has_space
+    # Filter out onsets that are too close together
+    times = []
+    for t in raw_times:
+        if not times or (t - times[-1]) >= MIN_CUE_GAP:
+            times.append(t)
     return times
 
 jump_times = load_jump_times(JSONL_PATH, video_fps)
@@ -183,6 +253,7 @@ player_avatars: list[pygame.Surface] = []
 player_id_map: dict[int, int] = {}
 player_actions: list[dict] = []
 player_scores: list[int] = []
+player_calories: list[float] = []
 player_prev_jumping: list[bool] = []
 
 start_time = time.time()
@@ -198,7 +269,9 @@ last_video_frame_idx = -1          # track which frame we last displayed
 def draw_video_bg(surface, ct):
     """Seek to the time-correct video frame for properly-paced playback."""
     global cached_frame_surf, last_video_frame_idx
-    target_frame = int(ct * video_fps) % max(video_total_frames, 1)
+    target_frame = int(ct * video_fps)
+    if target_frame >= video_total_frames:
+        return False  # Video finished
 
     if target_frame != last_video_frame_idx:
         current_pos = int(cap_video.get(cv2.CAP_PROP_POS_FRAMES))
@@ -209,17 +282,17 @@ def draw_video_bg(surface, ct):
             # Seek to the target frame
             cap_video.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             ret, frame = cap_video.read()
-        if not ret:
-            cap_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap_video.read()
+            
         if ret:
             frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = np.transpose(frame, (1, 0, 2))
             cached_frame_surf = pygame.surfarray.make_surface(frame)
             last_video_frame_idx = target_frame
+            
     if cached_frame_surf:
         surface.blit(cached_frame_surf, (0, 0))
+    return True
 
 
 def draw_webcam_bg(surface, wc_frame):
@@ -309,9 +382,17 @@ def draw_leaderboard(surface):
         # Name
         name = leaderboard_font.render(f"Player {i + 1}", True, WHITE)
         surface.blit(name, (sx + 52, y + 2))
-        # Score
-        pts = score_font.render(f"{player_scores[i]} pts", True, GREEN)
-        surface.blit(pts, (sx + 52, y + 32))
+        
+        # Split Score and Calories
+        pts_text = f"{player_scores[i]} pts"
+        cal_text = f"| {int(player_calories[i])} cal"
+        
+        pts_surf = score_font.render(pts_text, True, GREEN)
+        surface.blit(pts_surf, (sx + 52, y + 32))
+        
+        cal_surf = score_font.render(cal_text, True, ORANGE)
+        surface.blit(cal_surf, (sx + 52 + pts_surf.get_width() + 6, y + 32))
+        
         # Rank medal
         if rank == 0 and player_scores[i] > 0:
             medal = leaderboard_font.render("⭐", True, GOLD)
@@ -343,8 +424,12 @@ while running:
 
     # ── Draw background ─────────────────────────────────────────────
     screen.fill(DARK)
+    video_playing = False
     if state == STATE_PLAYING:
-        draw_video_bg(screen, ct)
+        video_playing = draw_video_bg(screen, ct)
+        if not video_playing and ret_wc:
+            # Video ended, fallback to webcam background
+            draw_webcam_bg(screen, wc_frame)
     elif ret_wc:
         draw_webcam_bg(screen, wc_frame)
 
@@ -385,7 +470,12 @@ while running:
                 for _ in range(locked_player_count)
             ]
             player_scores = [0] * locked_player_count
+            player_calories = [0.0] * locked_player_count
             player_prev_jumping = [False] * locked_player_count
+            player_inactive_frames = [0] * locked_player_count
+            # For calorie counting: tracking activity within 20-frame blocks
+            player_active_frames_in_block = [0] * locked_player_count
+            player_frames_in_block = [0] * locked_player_count
             player_id_map = {}
             detector = PoseDetector(
                 max_poses=locked_player_count, fps=webcam_fps
@@ -425,11 +515,47 @@ while running:
 
         draw_player_hud(screen)
 
-        # ── Score jump transitions (+10 per jump onset) ─────────────
+        # ── Advanced Scoring logic ──────────────────────────────────────────
         for slot in range(locked_player_count):
-            now_jumping = player_actions[slot].get("jumping", False)
+            actions = player_actions[slot]
+            now_jumping = actions.get("jumping", False)
+            now_running = actions.get("running", False)
+            
+            # Calories calculation (proportional up to ~0.4 per 20 frames)
+            player_frames_in_block[slot] += 1
+            if now_running or now_jumping:
+                player_active_frames_in_block[slot] += 1
+                
+            if player_frames_in_block[slot] >= 20:
+                if player_active_frames_in_block[slot] > 0:
+                    proportion = player_active_frames_in_block[slot] / 20.0
+                    player_calories[slot] += (0.4 * proportion)
+                player_frames_in_block[slot] = 0
+                player_active_frames_in_block[slot] = 0
+
+            # Check inactivity penalty (no running, no jumping)
+            if not now_running and not now_jumping:
+                player_inactive_frames[slot] += 1
+                if player_inactive_frames[slot] >= 20:
+                    player_scores[slot] -= 5
+                    player_inactive_frames[slot] = 0  # reset after deduction
+            else:
+                player_inactive_frames[slot] = 0
+
+            # Jump onset detection
             if now_jumping and not player_prev_jumping[slot]:
-                player_scores[slot] += 10
+                # Is there a valid cue window active?
+                valid_jump = False
+                for jt in jump_times:
+                    if (jt - CUE_SCORE_LEAD) <= ct <= (jt + CUE_LINGER):
+                        valid_jump = True
+                        break
+                        
+                if valid_jump:
+                    player_scores[slot] += 10
+                else:
+                    player_scores[slot] -= 5
+
             player_prev_jumping[slot] = now_jumping
 
         draw_leaderboard(screen)
@@ -452,44 +578,52 @@ while running:
         screen.blit(debug_surf, (2, WINDOW_HEIGHT - DEBUG_H))
 
     # ── Jump cue circle (bottom center) ────────────────────────────
-    if state == STATE_PLAYING:
+    if state == STATE_PLAYING and video_playing:
         cue_x = WINDOW_WIDTH // 2
         cue_y = WINDOW_HEIGHT - CUE_RADIUS - 30
 
-        # Always draw the target ring outline
-        pygame.draw.circle(screen, (60, 60, 60), (cue_x, cue_y), CUE_RADIUS, 3)
+        # Target ring backdrop is transparent now; drawn at the end as an outline
 
-        # Active cue — fill the circle green
-        show_cue = False
-        for jt in jump_times:
-            if (jt - CUE_LEAD) <= ct <= (jt + CUE_LINGER):
-                show_cue = True
-                break
-        if show_cue:
-            pygame.draw.circle(screen, GREEN, (cue_x, cue_y), CUE_RADIUS)
-            pygame.draw.circle(screen, WHITE, (cue_x, cue_y), CUE_RADIUS, 3)
-
-        # Falling approach indicators
-        approach_start_y = 80              # start near top of screen
-        for jt in jump_times:
-            arrive_time = jt - CUE_LEAD    # when the ball should reach the target
+        # Draw stacked approaching + lingering cues
+        for idx, jt in enumerate(jump_times):
+            arrive_time = jt - CUE_LEAD
             approach_start_t = arrive_time - CUE_APPROACH_TIME
-            if approach_start_t <= ct < arrive_time:
-                # Progress 0→1 as the circle falls
-                progress = (ct - approach_start_t) / CUE_APPROACH_TIME
-                # Interpolate Y from top to target
-                fall_y = int(approach_start_y + (cue_y - approach_start_y) * progress)
-                # Shrink from 18px to CUE_RADIUS as it approaches
-                ball_r = int(18 + (CUE_RADIUS - 18) * progress)
-                # Fade in opacity
-                alpha = int(80 + 175 * progress)
-                # Draw the falling ball
-                ball_surf = pygame.Surface((ball_r * 2, ball_r * 2), pygame.SRCALPHA)
-                pygame.draw.circle(ball_surf, (0, 200, 80, alpha),
-                                   (ball_r, ball_r), ball_r)
-                pygame.draw.circle(ball_surf, (255, 255, 255, alpha),
-                                   (ball_r, ball_r), ball_r, 2)
-                screen.blit(ball_surf, (cue_x - ball_r, fall_y - ball_r))
+            
+            # Active in approach window or linger window
+            if approach_start_t <= ct <= (jt + CUE_LINGER):
+                if ct < arrive_time:
+                    progress = (ct - approach_start_t) / CUE_APPROACH_TIME
+                else:
+                    progress = 1.0  # Fully filled if lingering
+                
+                # Circle fills from inside out (radius starts at 0, grows to CUE_RADIUS)
+                fill_r = int(CUE_RADIUS * progress)
+                
+                color = CUE_COLORS[idx % len(CUE_COLORS)]
+                
+                if fill_r > 0:
+                    pygame.draw.circle(screen, color, (cue_x, cue_y), fill_r)
+                    
+                # Sunburst effect when fully filled, for ~5 frames (5/30 seconds)
+                if ct >= arrive_time and ct <= arrive_time + (5 / FPS):
+                    # How far along the 5-frame burst we are
+                    burst_prog = (ct - arrive_time) / (5 / FPS)
+                    line_len_base = 25
+                    # Flare expanding outwards
+                    flare_start = CUE_RADIUS + int(15 * burst_prog)
+                    flare_end = flare_start + int(line_len_base * (1.0 - burst_prog))
+                    
+                    if flare_end > flare_start:
+                        for angle_deg in range(0, 360, 30): # 12 rays
+                            angle_rad = math.radians(angle_deg)
+                            start_x = cue_x + int(flare_start * math.cos(angle_rad))
+                            start_y = cue_y + int(flare_start * math.sin(angle_rad))
+                            end_x = cue_x + int(flare_end * math.cos(angle_rad))
+                            end_y = cue_y + int(flare_end * math.sin(angle_rad))
+                            pygame.draw.line(screen, (255, 50, 50), (start_x, start_y), (end_x, end_y), 5)
+                        
+        # Foremost border
+        pygame.draw.circle(screen, WHITE, (cue_x, cue_y), CUE_RADIUS, 3)
 
     pygame.display.flip()
 
