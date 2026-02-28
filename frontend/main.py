@@ -1,3 +1,5 @@
+import subprocess
+import imageio_ffmpeg as ffmpeg
 import pygame
 import cv2
 import numpy as np
@@ -5,6 +7,19 @@ import time
 import math
 import os
 import yt_dlp
+import boto3
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("AWS_KEY"),
+    aws_secret_access_key=os.getenv("SECRET_AWS_KEY"),
+    region_name='us-east-1'
+)
+bucket_name = "minecraft-videos-dance"
 
 VIDEO_URL    = "https://www.youtube.com/watch?v=lekKHbYQGxM"
 WINDOW_WIDTH  = 960
@@ -27,15 +42,37 @@ PLAYER_COLORS = [
     (255, 220, 0  ),
     (80,  255, 160),
 ]
-VIDEO_PATH = "video.mp4"
+
+PRE_VIDEO_PATH = "video.mp4"
+VIDEO_PATH = "converted_video.mp4"
 
 ydl_opts = {
     'outtmpl': 'video.%(ext)s',
     'format': 'best[ext=mp4]',
 }
 
+if os.path.exists(VIDEO_PATH):
+    os.remove(VIDEO_PATH)
+if os.path.exists(PRE_VIDEO_PATH):
+    os.remove(PRE_VIDEO_PATH)
 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
     ydl.download([VIDEO_URL])
+
+def convert_video(input_path, output_path):
+
+    command = [
+        ffmpeg.get_ffmpeg_exe(),
+        '-i', input_path,
+        '-vf', 'fps=20,scale=640:360',
+        '-c:v', 'libx264',
+        '-crf', '23',
+        '-preset', 'ultrafast',
+        output_path
+    ]
+
+    subprocess.run(command, check=True)
+
+convert_video(PRE_VIDEO_PATH, VIDEO_PATH)
 
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
