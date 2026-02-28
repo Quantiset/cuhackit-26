@@ -80,7 +80,7 @@ SIDEBAR_BG = (20, 20, 30, 180)
 VOICE_LINES = [
     "chicken jockey",
     "water bucket, release",
-    "amaezing",
+    "amaaazing",
     "i am steve",
     "this... is a crafting table",
     "they love crushing loaf",
@@ -238,7 +238,7 @@ def play_congratulations(scores: list, calories: list, ct: float):
     if now - last_congrats_time < effective_cooldown:
         return
 
-    use_gemini = random.random() < 0.00
+    use_gemini = random.random() < 0.30
 
     if use_gemini:
         last_congrats_time = now
